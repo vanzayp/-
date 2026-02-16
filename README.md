@@ -227,3 +227,85 @@ Bundle読込とAnimation変換を最初から整理（完全版）
 - `AssetStudio/YAML/Base/*`
 - `AssetStudio/YAML/Utils/Extensions/*`
 - `AssetStudio.CLI/Exporter.cs`, `AssetStudio.GUI/Exporter.cs`
+
+
+## C. 始点からの再追跡ログ（実コードを1本ずつ辿った記録）
+
+> ここは「どのコードを起点に、どの関数を通って、何を作るか」を再追跡した監査ログ。
+> A/Bの要約ではなく、始点ごとの通過点を固定化する。
+
+### C-1. 始点: CLIの単体AnimationClip出力
+1. `AssetStudio.CLI/Program.cs` でCLI引数処理開始
+2. `AssetStudio.CLI/Studio.cs` で読み込み・オブジェクト列挙
+3. `AssetStudio.CLI/Exporter.ExportAnimationClip`
+4. `AnimationClipExtensions.Convert`
+5. `AnimationClipConverter.Process` -> `ProcessInner`
+6. `ConvertSerializedAnimationClip` -> `YAMLWriter.Write`
+7. `File.WriteAllText(... .anim)`
+
+### C-2. 始点: GUIの単体AnimationClip出力
+1. `AssetStudio.GUI/MainForm.cs` / `AssetStudio.GUI/Studio.cs` からエクスポート指示
+2. `AssetStudio.GUI/Exporter.ExportAnimationClip`
+3. 以降はCLIと同一（`Convert` -> `ProcessInner` -> YAML化 -> 書込）
+
+### C-3. 始点: Bundle入力（最頻出）
+1. `AssetsManager.LoadFiles` / `LoadFolder`
+2. `LoadFile` の `FileType` 分岐
+3. `FileType.BundleFile` で `LoadBundleFile`
+4. `new BundleFile(reader, game)`
+5. `ReadBundleHeader` -> `ReadHeader` -> `ReadBlocksInfoAndDirectory`
+6. `ReadBlocks` で展開
+7. `ReadFiles` で `StreamFile` 切り出し
+8. `LoadAssetsFromMemory` で `SerializedFile` 化
+9. `ReadAssets` で `ClassIDType.AnimationClip => new AnimationClip(objectReader)`
+10. `Exporter.ExportAnimationClip` へ渡してB系処理へ接続
+
+### C-4. 始点: Web/Zip/Block入力（派生ルート）
+- `LoadWebFile`:
+  - Web内部エントリを再帰読み込みし、AssetsFile/BundleFile/ResourceFileへ再分岐
+- `LoadZipFile`:
+  - zip entryをメモリ展開して `LoadFile` 再投入
+- `LoadBlockFile` / `LoadBlkFile` / `LoadMhyFile`:
+  - ブロック単位で内部ストリームを切り、Bundle/Mhy等へ再分岐
+- どの派生ルートも最終的に `LoadAssetsFromMemory` と `ReadAssets` へ合流する
+
+### C-5. Animation変換フェーズの関数責務（再監査）
+- `ProcessInner`
+  - 全体実行順序制御（ACL先行/後行分岐含む）
+- `ProcessStreams`
+  - StreamedFrameを読み、補間傾き(in/out slope)を計算してTransform/Default/Customへ振分
+- `ProcessDenses`
+  - Dense sampleを時系列展開して同様に振分
+- `ProcessACLClip`
+  - ACL圧縮値を展開して同様に振分
+- `ProcessConstant`
+  - 終端フレーム補完
+- `CreateCurves`
+  - 内部辞書を最終カーブ配列へコミット
+
+### C-6. パス/属性解決の関数責務（再監査）
+- `AnimationClipExtensions.FindTOS`
+  - Avatar / Animator / Animation 起点でpath辞書を収集
+- `BuildTOS`
+  - Transform階層から `parent/child` を構築し、CRCハッシュ化
+- `GetCurvePath`
+  - `binding.path` ハッシュ -> 文字列path、見つからなければ `path_<hash>`
+- `CustomCurveResolver.ToAttributeName`
+  - `customType + attribute + path` から最終プロパティ名へ変換
+
+### C-7. 出力終端（再監査）
+1. `ConvertSerializedAnimationClip`
+2. `ExportYAMLDocument`
+3. `YAMLWriter.AddDocument`
+4. `YAMLWriter.Write`
+5. Exporterの `File.WriteAllText` で `.anim` 保存
+
+### C-8. 再監査チェック（始点別）
+- [x] CLI始点
+- [x] GUI始点
+- [x] Bundle始点
+- [x] Web始点
+- [x] Zip始点
+- [x] Block/Blk/Mhy始点
+- [x] Path解決始点
+- [x] YAML出力終端
