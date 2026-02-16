@@ -156,3 +156,104 @@ Bundle読込 → AnimationClip変換 → `.anim` 出力（再整理版）
 - `AssetStudio.Utility/YAML/AnimationClipExtensions.cs`
 - `AssetStudio.Utility/YAML/AnimationClipConverter.cs`
 - `AssetStudio.Utility/YAML/CustomCurveResolver.cs`
+
+
+## 7. 非省略版: 全分岐ルート（省略語なし）
+
+> ここは「最小経路」ではなく、`AssetsManager` と変換側の分岐をそのまま列挙する。
+
+### 7-1. `AssetsManager.LoadFile(FileReader)` の全分岐
+- `FileType.AssetsFile` -> `LoadAssetsFile`
+- `FileType.BundleFile` -> `LoadBundleFile`
+- `FileType.WebFile` -> `LoadWebFile`
+- `FileType.GZipFile` -> `DecompressGZip` -> `LoadFile`
+- `FileType.BrotliFile` -> `DecompressBrotli` -> `LoadFile`
+- `FileType.ZipFile` -> `LoadZipFile`
+- `FileType.BlockFile` -> `LoadBlockFile`
+- `FileType.BlkFile` -> `LoadBlkFile`
+- `FileType.MhyFile` -> `LoadMhyFile`
+
+### 7-2. `LoadBundleFile` 内部
+- `new BundleFile(reader, Game)`
+- `bundleFile.fileList` を走査
+  - `subReader.FileType == AssetsFile` -> `LoadAssetsFromMemory`
+  - それ以外 -> `resourceFileReaders.TryAdd`
+
+### 7-3. `BundleFile` コンストラクタの全分岐
+- `signature == UnityArchive` -> 現状TODO
+- `signature in {UnityWeb, UnityRaw}`
+  - version 6 なら UnityFS ルートへ
+  - それ以外: `ReadHeaderAndBlocksInfo` -> `ReadBlocksAndDirectory` -> `ReadFiles`
+- `signature in {UnityFS, ENCR}`
+  - `ReadHeader`
+  - `game.Type.IsUnityCN()` なら `ReadUnityCN`
+  - `ReadBlocksInfoAndDirectory`
+  - `ReadBlocks`
+  - `ReadFiles`
+
+### 7-4. `LoadWebFile` 内部再帰分岐
+Webエントリごとに `subReader.FileType` で:
+- `AssetsFile` -> `LoadAssetsFromMemory`
+- `BundleFile` -> `LoadBundleFile`
+- `WebFile` -> `LoadWebFile`（再帰）
+- `ResourceFile` -> `resourceFileReaders.TryAdd`
+
+### 7-5. `LoadZipFile` 内部
+- splitエントリ (`.splitN`) を結合して `LoadFile(entryReader)`
+- 通常entryをメモリ展開して `LoadFile(entryReader)`
+- `ResourceFile` の場合は `resourceFileReaders.TryAdd`
+
+### 7-6. `LoadBlockFile` / `LoadBlkFile` / `LoadMhyFile`
+- `LoadBlockFile`: offsetごとに `ENCR|Bundle -> LoadBundleFile`, `Blb -> LoadBlbFile`, `Mhy -> LoadMhyFile`
+- `LoadBlkFile`: 復号後offsetごとに `Bundle -> LoadBundleFile`, `Mhy -> LoadMhyFile`
+- `LoadMhyFile`: `fileList` 走査、`AssetsFile -> LoadAssetsFromMemory`, その他は `resourceFileReaders.TryAdd`
+
+### 7-7. `ReadAssets` の型分岐（Animation出力に関係する部分）
+- `ClassIDType.AnimationClip` -> `new AnimationClip(objectReader)`
+- 関連参照構築は `ProcessAssets`（GameObject-Component関連付け）で実施
+
+### 7-8. Exporter側の全経路
+- `ExportAnimationClip`（CLI/GUI）
+  1. `TryExportFile(..., ".anim", out exportFullPath)`
+  2. `m_AnimationClip.Convert()`
+  3. `string.IsNullOrEmpty(str)` なら失敗
+  4. `File.WriteAllText(exportFullPath, str)`
+- `ExportConvertFile`（CLI/GUI）
+  - `switch(item.TypeString)`
+  - `ClassIDType.AnimationClip` の場合 `ExportAnimationClip` に合流
+
+### 7-9. `AnimationClipExtensions.Convert` の全処理
+1. `!clip.m_Legacy || clip.m_MuscleClip != null` 判定
+2. 真なら `AnimationClipConverter.Process(clip)`
+3. `converter.Rotations/Eulers/Translations/Scales/Floats/PPtrs` を既存カーブへ `Union`
+4. `ConvertSerializedAnimationClip(clip)` を返却
+
+### 7-10. `AnimationClipConverter.ProcessInner` の全順序
+1. `m_Clip = animationClip.m_MuscleClip.m_Clip`
+2. `bindings = animationClip.m_ClipBindingConstant`
+3. `tos = animationClip.FindTOS()`
+4. `streamedFrames = m_Clip.m_StreamedClip.ReadData()`
+5. `lastDenseFrame` / `lastSampleFrame` / `lastFrame` 計算
+6. `m_Clip.m_ACLClip.IsSet && !SR` なら `ProcessACLClip`
+7. `ProcessStreams`
+8. `ProcessDenses`
+9. `m_Clip.m_ACLClip.IsSet && SR` なら `ProcessACLClip`
+10. `m_Clip.m_ConstantClip != null` なら `ProcessConstant`
+11. `CreateCurves`
+
+### 7-11. パス解決の全関数鎖
+- `FindTOS`（初期値 `{0:""}`）
+- `AddAvatarTOS` / `AddAnimatorTOS` / `AddAnimationTOS`
+- `BuildTOS`（`parent/child` を構築し `CRC.CalculateDigestUTF8(path)` をキー化）
+- `GetCurvePath(tos, binding.path)`
+  - hit: 実path
+  - miss: `path_<hash>`
+- `AddCustomCurve` -> `CustomCurveResolver.ToAttributeName(customType, attribute, path)`
+
+### 7-12. YAML出力の全終端鎖
+- `ConvertSerializedAnimationClip`
+- `ExportYAMLDocument`
+- `YAMLWriter.AddDocument`
+- `YAMLWriter.Write`
+- `Exporter.ExportAnimationClip` へ戻る
+- `File.WriteAllText(... .anim)`
