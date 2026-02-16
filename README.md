@@ -587,6 +587,16 @@ Unity Editor移植時の実務メモ（省略なし）
 8. 既存カーブと `Union` して `AnimationClip` へ反映。
 9. `ConvertSerializedAnimationClip` → `ExportYAMLDocument` → `YAMLWriter.Write` で `.anim` YAML文字列化。
 
+#### パス処理（不足していた部分）
+1. `FindTOS()` で `Dictionary<uint, string>` を作る。
+   - ルートは `0 -> ""`。
+   - 子階層は `parent/child` 形式で連結し、`CRC.CalculateDigestUTF8(path)` をキーに登録。
+2. 各カーブ処理 (`ProcessStreams / ProcessDenses / ProcessACLClip / ProcessConstant`) で、`binding.path` を `GetCurvePath(tos, binding.path)` に通す。
+3. `tos` にハッシュが無い場合、`GetCurvePath` は `path_<hash>` を返す（UnknownPath扱い）。
+4. `AddCustomCurve` では `CustomCurveResolver.ToAttributeName(type, attribute, path)` を呼び、`path` と `attribute` から最終プロパティ名を解決。
+   - 例: `RendererMaterial`, `BlendShape`, `MonoBehaviour` などは `path` 先の実オブジェクトを辿って属性名を逆引き。
+5. UnknownPath (`path_<hash>`) の場合は解決不能前提でフォールバック名（`material.<id>` 等）を使い、YAML出力自体は継続する。
+
 #### どの値がどう変わるか（要点）
 - 入力: 圧縮/分割されたキー列（streamed/dense/acl/constant）+ binding情報 + TOS(path辞書)
 - 中間: `AddTransformCurve` / `AddCustomCurve` / `AddFloatKeyframe` / `AddPPtrKeyframe` で型付きKeyframe化
