@@ -51,3 +51,9 @@ Special Thank to:
 - Ds5678: [AssetRipper](https://github.com/AssetRipper/AssetRipper)[[discord](https://discord.gg/XqXa53W2Yh)] for information about Asset Formats & Parsing.
 - mafaca: [uTinyRipper](https://github.com/mafaca/UtinyRipper) for `YAML` and `AnimationClipConverter`. 
 
+_____________________________________________________________________________________________________________________________
+Reflection / 反省点:
+- We repeatedly expanded and rewrote this README without a stable structure, which made the document noisy and hard to review.
+- We mixed “minimum flow” and “full flow” descriptions in different revisions, which caused confusion.
+- We should have kept one fixed format (entry point -> branch -> conversion -> output) and validated coverage before updating.
+- Going forward, README updates should be done in a single pass with a checklist and line-by-line verification before commit.
