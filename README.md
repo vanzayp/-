@@ -53,360 +53,302 @@ Special Thank to:
 
 
 _____________________________________________________________________________________________________________________________
-Bundle読込とAnimation変換を最初から整理（完全版）
+ゼロベース再構築: 全コード始点→終点トレース（.anim出力）
 
-この章は、**AssetStudioの「Bundle読込」と「.anim変換」を責務分離して、実コードの順序で追跡**するための再構成版です。
+この章は**継ぎ足し説明を破棄**して作り直した版です。
+終点は固定で `File.WriteAllText(... .anim)` とします。
 
-## 0. 結論（先に要点）
+## 1) 終点の定義
+- 終点: Exporter が `.anim` パスへ `File.WriteAllText` した時点。
 
-- **A: Bundle読込系** は「ファイル -> 復号/解凍 -> SerializedFile -> `AssetStudio.AnimationClip`生成」まで。
-- **B: Animation変換系** は「`AssetStudio.AnimationClip` -> カーブ再構築 -> YAML文字列 -> `.anim`書込」まで。
-- AとBの橋渡しは `AssetStudio.AnimationClip` オブジェクトのみ。
-
----
-
-## A. Bundle読込処理（Input / Decode / Deserialize）
-
-### A-1. エントリ
-- `AssetsManager.LoadFiles(...)` / `AssetsManager.LoadFolder(...)`
-- 分割ファイル処理: `MergeSplitAssets`, `ProcessingSplitFiles`
-- ループで `LoadFile(...)` を呼び出し
-
-### A-2. ファイルタイプ分岐（`AssetsManager.LoadFile`）
-- `AssetsFile` -> `LoadAssetsFile`
-- `BundleFile` -> `LoadBundleFile`
-- `WebFile` -> `LoadWebFile`
-- `ZipFile` -> `LoadZipFile`
-- `Block/Blk/Mhy` -> `LoadBlockFile` / `LoadBlkFile` / `LoadMhyFile`
-
-### A-3. Bundle解析（`BundleFile`）
-1. `ReadBundleHeader`
-2. `ReadHeader`（必要なら `ReadUnityCN`）
-3. `ReadBlocksInfoAndDirectory`
-4. `ReadBlocks`（LZMA/LZ4/Zstd/None などを展開）
-5. `ReadFiles`（`StreamFile`群へ展開）
-
-### A-4. Assets化
-- `LoadBundleFile` が `bundleFile.fileList` を走査
-- 各streamを `FileReader` 化
-- `AssetsFile` は `LoadAssetsFromMemory`
-- 非AssetsFileは `resourceFileReaders` にキャッシュ
-
-### A-5. オブジェクト復元
-- `ReadAssets` で `ObjectReader` を作成
-- `ClassIDType` で実クラスへ分岐
-- `ClassIDType.AnimationClip` は `new AnimationClip(objectReader)`
-
-### A-6. Aの成果物
-- `assetsFileList`
-- `SerializedFile.Objects` に `AssetStudio.AnimationClip` が載る
-
----
-
-## B. Animation変換処理（Convert / Serialize / Write）
-
-### B-1. 入口（Exporter）
-- `AssetStudio.CLI/Exporter.cs` と `AssetStudio.GUI/Exporter.cs` の `ExportAnimationClip` が入口。
-- `m_AnimationClip.Convert()` を呼び、戻り値文字列を `File.WriteAllText(... .anim)` で保存。
-
-### B-2. Convertの外枠（`AnimationClipExtensions.Convert`）
-1. 対象が `!m_Legacy || m_MuscleClip != null` の場合、`AnimationClipConverter.Process(clip)` を実行。
-2. `Process` が生成したカーブ群を既存カーブへ `Union`:
-   - `m_RotationCurves`
-   - `m_EulerCurves`
-   - `m_PositionCurves`
-   - `m_ScaleCurves`
-   - `m_FloatCurves`
-   - `m_PPtrCurves`
-3. `ConvertSerializedAnimationClip` で YAML 文字列へ変換。
-
-### B-3. 変換の中心（`AnimationClipConverter.ProcessInner`）
-`AnimationClipConverter.Process` は内部で `ProcessInner` を実行し、以下の順で処理する。
-
-1. **前処理**
-   - `m_Clip = animationClip.m_MuscleClip.m_Clip`
-   - `bindings = animationClip.m_ClipBindingConstant`
-   - `tos = animationClip.FindTOS()`
-2. **生データ展開**
-   - `streamedFrames = m_Clip.m_StreamedClip.ReadData()`
-   - `lastFrame`（dense/stream 由来）を計算
-3. **ACL先行処理（条件付き）**
-   - `m_ACLClip.IsSet && !SR` の場合、先に `ProcessACLClip` を実行
-4. **stream処理**
-   - `ProcessStreams(streamedFrames, bindings, tos, sampleRate)`
-5. **dense処理**
-   - `ProcessDenses(m_Clip, bindings, tos)`
-6. **ACL後行処理（SR条件）**
-   - `m_ACLClip.IsSet && SR` の場合、ここで `ProcessACLClip`
-7. **constant処理**
-   - `m_ConstantClip != null` の場合、`ProcessConstant`
-8. **カーブ確定**
-   - `CreateCurves()` で内部辞書から最終カーブ配列へ反映
-
-### B-4. 各フェーズで何を変換しているか
-- `ProcessStreams`
-  - streamフレームのキー列を走査し、`bindings.FindBinding(index)` でバインディング特定。
-  - Transform系は `AddTransformCurve`、それ以外は `AddDefaultCurve`/`AddCustomCurve`。
-- `ProcessDenses`
-  - dense配列を `frameIndex / sampleRate` の時間軸で展開。
-  - binding種別ごとに Transform/Default/Custom へ分配。
-- `ProcessACLClip`
-  - `acl.Process(...)` でACL圧縮値を展開し、時間付きキー列へ変換。
-- `ProcessConstant`
-  - constant値を `lastFrame` に配置し、不足終端を補完。
-
-### B-5. パス解決（変換で必須）
-1. `FindTOS()` が `Dictionary<uint, string>` を構築（`CRC.CalculateDigestUTF8(path)` -> `path`）。
-2. 各フェーズで `binding.path` を `GetCurvePath(tos, binding.path)` で文字列パスへ変換。
-3. 見つからないハッシュは `path_<hash>` を返して継続。
-4. `AddCustomCurve` は `CustomCurveResolver.ToAttributeName(customType, attribute, path)` で最終プロパティ名へ解決。
-
-### B-6. YAML化（`ConvertSerializedAnimationClip`）
-1. `ExportYAMLDocument(animationClip)` でYAMLドキュメント作成
-2. `YAMLWriter.AddDocument(doc)`
-3. `YAMLWriter.Write(StringWriter)`
-4. 生成文字列をExporterが `.anim` として保存
-
-### B-7. Bの成果物
-- `.anim`（Unity YAML形式）
+## 2) 正規トレースID（終点到達チェーン）
+- `CHAIN-L1`: Load入口 -> LoadFile分岐 -> コンテナ解析 -> ReadAssets -> ExportAnimationClip -> Convert -> YAML -> WriteAllText
+- `CHAIN-E1`: ExportAnimationClip -> Convert -> ConvertSerializedAnimationClip -> YAMLWriter.Write -> File.WriteAllText
+- `CHAIN-C1`: Convert -> Process -> ProcessInner -> (ACL/Stream/Dense/Constant) -> CreateCurves -> ConvertSerializedAnimationClip
+- `CHAIN-P1`: FindTOS -> BuildTOS -> GetCurvePath -> AddCustomCurve -> ToAttributeName
 
 
-### B-8. 抜けゼロ検証表（コード照合）
+## 3) 直接経路（関数単位）
 
-| フェーズ | 入力 | 主要分岐 | パス利用 | 出力 |
-|---|---|---|---|---|
-| `ProcessStreams` | `streamFrames`, `bindings`, `tos`, `sampleRate` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | Transform/Default/Customキー追加 |
-| `ProcessDenses` | `dense.m_SampleArray`, `bindings`, `tos` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | 時系列キー追加 |
-| `ProcessACLClip` | `acl.Process(...)` 展開値, `bindings`, `tos` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | ACL由来キー追加 |
-| `ProcessConstant` | `constant.data`, `bindings`, `tos`, `lastFrame` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | 終端補完キー追加 |
-| `CreateCurves` | 内部辞書 (`m_translations` など) | なし | なし | `Translations/Rotations/...` へ確定 |
-| `ConvertSerializedAnimationClip` | `AnimationClip` | なし | なし | YAML文字列 |
-
-### B-9. 未記載項目なしチェックリスト
-
-- [x] 入口 (`ExportAnimationClip`)
-- [x] `AnimationClipExtensions.Convert` の条件分岐
-- [x] `ProcessInner` の実行順序
-- [x] `ProcessStreams` / `ProcessDenses` / `ProcessACLClip` / `ProcessConstant`
-- [x] `FindTOS` と `GetCurvePath`
-- [x] UnknownPath (`path_<hash>`) フォールバック
-- [x] `CustomCurveResolver.ToAttributeName`
-- [x] `CreateCurves` での最終反映
-- [x] `ConvertSerializedAnimationClip` -> `ExportYAMLDocument` -> `YAMLWriter.Write`
-- [x] `.anim` ファイル書き込み (`File.WriteAllText`)
-
----
-
-## A/B 接続点（実装境界）
-
-- 接続データ: `AssetStudio.AnimationClip`
-- 接続呼び出し: `AnimationClipExtensions.Convert`
-- 境界を守る実装順:
-  1. Aを先に完成（Bundle -> AnimationClip抽出）
-  2. Bを完成（AnimationClip -> .anim）
-  3. 最後にA/Bを接続
-
----
-
-## 追跡に使う主要ソース（最小セット）
-
-### A側
-- `AssetStudio/AssetsManager.cs`
-- `AssetStudio/BundleFile.cs`
-- `AssetStudio/FileReader.cs`
-- `AssetStudio/SerializedFile.cs`
-- `AssetStudio/ObjectReader.cs`
-- `AssetStudio/Classes/AnimationClip.cs`
-- `AssetStudio/Crypto/*`, `AssetStudio/LZ4/*`, `AssetStudio/Brotli/*`, `AssetStudio/7zip/*`
-
-### B側
-- `AssetStudio.Utility/YAML/AnimationClipConverter.cs`
-- `AssetStudio.Utility/YAML/AnimationClipExtensions.cs`
-- `AssetStudio.Utility/YAML/CustomCurveResolver.cs`
-- `AssetStudio.Utility/YAML/MuscleHelper.cs`
-- `AssetStudio/YAML/Base/*`
-- `AssetStudio/YAML/Utils/Extensions/*`
-- `AssetStudio.CLI/Exporter.cs`, `AssetStudio.GUI/Exporter.cs`
-
-
-## C. 始点からの再追跡ログ（実コードを1本ずつ辿った記録）
-
-> ここは「どのコードを起点に、どの関数を通って、何を作るか」を再追跡した監査ログ。
-> A/Bの要約ではなく、始点ごとの通過点を固定化する。
-
-### C-1. 始点: CLIの単体AnimationClip出力
-1. `AssetStudio.CLI/Program.cs` でCLI引数処理開始
-2. `AssetStudio.CLI/Studio.cs` で読み込み・オブジェクト列挙
-3. `AssetStudio.CLI/Exporter.ExportAnimationClip`
-4. `AnimationClipExtensions.Convert`
-5. `AnimationClipConverter.Process` -> `ProcessInner`
-6. `ConvertSerializedAnimationClip` -> `YAMLWriter.Write`
-7. `File.WriteAllText(... .anim)`
-
-### C-2. 始点: GUIの単体AnimationClip出力
-1. `AssetStudio.GUI/MainForm.cs` / `AssetStudio.GUI/Studio.cs` からエクスポート指示
-2. `AssetStudio.GUI/Exporter.ExportAnimationClip`
-3. 以降はCLIと同一（`Convert` -> `ProcessInner` -> YAML化 -> 書込）
-
-### C-3. 始点: Bundle入力（最頻出）
-1. `AssetsManager.LoadFiles` / `LoadFolder`
-2. `LoadFile` の `FileType` 分岐
-3. `FileType.BundleFile` で `LoadBundleFile`
-4. `new BundleFile(reader, game)`
-5. `ReadBundleHeader` -> `ReadHeader` -> `ReadBlocksInfoAndDirectory`
-6. `ReadBlocks` で展開
-7. `ReadFiles` で `StreamFile` 切り出し
-8. `LoadAssetsFromMemory` で `SerializedFile` 化
-9. `ReadAssets` で `ClassIDType.AnimationClip => new AnimationClip(objectReader)`
-10. `Exporter.ExportAnimationClip` へ渡してB系処理へ接続
-
-### C-4. 始点: Web/Zip/Block入力（派生ルート）
-- `LoadWebFile`:
-  - Web内部エントリを再帰読み込みし、AssetsFile/BundleFile/ResourceFileへ再分岐
-- `LoadZipFile`:
-  - zip entryをメモリ展開して `LoadFile` 再投入
-- `LoadBlockFile` / `LoadBlkFile` / `LoadMhyFile`:
-  - ブロック単位で内部ストリームを切り、Bundle/Mhy等へ再分岐
-- どの派生ルートも最終的に `LoadAssetsFromMemory` と `ReadAssets` へ合流する
-
-### C-5. Animation変換フェーズの関数責務（再監査）
-- `ProcessInner`
-  - 全体実行順序制御（ACL先行/後行分岐含む）
-- `ProcessStreams`
-  - StreamedFrameを読み、補間傾き(in/out slope)を計算してTransform/Default/Customへ振分
-- `ProcessDenses`
-  - Dense sampleを時系列展開して同様に振分
-- `ProcessACLClip`
-  - ACL圧縮値を展開して同様に振分
-- `ProcessConstant`
-  - 終端フレーム補完
-- `CreateCurves`
-  - 内部辞書を最終カーブ配列へコミット
-
-### C-6. パス/属性解決の関数責務（再監査）
-- `AnimationClipExtensions.FindTOS`
-  - Avatar / Animator / Animation 起点でpath辞書を収集
-- `BuildTOS`
-  - Transform階層から `parent/child` を構築し、CRCハッシュ化
-- `GetCurvePath`
-  - `binding.path` ハッシュ -> 文字列path、見つからなければ `path_<hash>`
-- `CustomCurveResolver.ToAttributeName`
-  - `customType + attribute + path` から最終プロパティ名へ変換
-
-### C-7. 出力終端（再監査）
-1. `ConvertSerializedAnimationClip`
-2. `ExportYAMLDocument`
-3. `YAMLWriter.AddDocument`
-4. `YAMLWriter.Write`
-5. Exporterの `File.WriteAllText` で `.anim` 保存
-
-### C-8. 再監査チェック（始点別）
-- [x] CLI始点
-- [x] GUI始点
-- [x] Bundle始点
-- [x] Web始点
-- [x] Zip始点
-- [x] Block/Blk/Mhy始点
-- [x] Path解決始点
-- [x] YAML出力終端
-
-
-## D. 「全始点→終点」関数遷移表（曖昧語なし）
-
-> ここでの「始点」は、AnimationClipが`.anim`へ到達し得る**実際の関数入口**を指す。
-> それぞれに対し、終点 `File.WriteAllText(... .anim)` までの遷移を列挙する。
-
-### D-1. 始点群（入口関数を全列挙）
-
-#### 1) 読み込み入口（AssetsManager）
-- `LoadFiles`
-- `LoadFolder`
-- `Load`（内部キュー処理）
-- `LoadFile(string)`
-- `LoadFile(FileReader)`
-- `LoadAssetsFile`
-- `LoadBundleFile`
-- `LoadWebFile`
-- `LoadZipFile`
-- `LoadBlockFile`
-- `LoadBlkFile`
-- `LoadMhyFile`
-- `LoadAssetsFromMemory`
-- `ReadAssets`
-- `ProcessAssets`
-
-#### 2) 変換入口（Exporter）
-- `AssetStudio.CLI.Exporter.ExportAnimationClip`
-- `AssetStudio.GUI.Exporter.ExportAnimationClip`
-- `AssetStudio.CLI.Exporter.ExportConvertFile`（内部で `ClassIDType.AnimationClip` なら `ExportAnimationClip`）
-- `AssetStudio.GUI.Exporter.ExportConvertFile`（同上）
-
-#### 3) 変換コア入口
-- `AnimationClipExtensions.Convert`
-- `AnimationClipConverter.Process`
-
-### D-2. 読み込み入口ごとの終点到達遷移
-
-#### A) `LoadFiles` / `LoadFolder` 起点
-`LoadFiles|LoadFolder -> Load -> LoadFile(string) -> LoadFile(FileReader)`
-
-`LoadFile(FileReader)` の分岐:
-- `AssetsFile -> LoadAssetsFile -> (必要なら外部参照追加) -> ReadAssets`
-- `BundleFile -> LoadBundleFile -> LoadAssetsFromMemory -> ReadAssets`
-- `WebFile -> LoadWebFile -> (Assets/Bundle/Web/Resource 再帰) -> ReadAssets`
-- `ZipFile -> LoadZipFile -> (entryごとにLoadFile再投入) -> ReadAssets`
-- `BlockFile -> LoadBlockFile -> (Bundle/Blb/Mhyへ再分岐) -> ReadAssets`
-- `BlkFile -> LoadBlkFile -> (Bundle/Mhyへ再分岐) -> ReadAssets`
-- `MhyFile -> LoadMhyFile -> LoadAssetsFromMemory -> ReadAssets`
-
-`ReadAssets` 到達後:
+### 3-1 読み込み側（終点へ向かう主鎖）
+- `AssetsManager.LoadFiles / LoadFolder`
+- `AssetsManager.Load`
+- `AssetsManager.LoadFile(string/FileReader)`
+- `AssetsManager.LoadBundleFile / LoadWebFile / LoadZipFile / LoadBlockFile / LoadBlkFile / LoadMhyFile`
+- `AssetsManager.LoadAssetsFromMemory`
+- `AssetsManager.ReadAssets`
 - `ClassIDType.AnimationClip => new AnimationClip(objectReader)`
-- GUI/CLIで対象が選択されると `Exporter.ExportAnimationClip` へ
-- 終点: `File.WriteAllText(... .anim)`
 
-#### B) `LoadAssetsFromMemory` 直接起点
-`LoadAssetsFromMemory -> assetsFileList登録 -> ReadAssets -> AnimationClip生成 -> Exporter.ExportAnimationClip -> File.WriteAllText(... .anim)`
+### 3-2 変換側（終点直前の主鎖）
+- `Exporter.ExportAnimationClip` (CLI/GUI)
+- `AnimationClipExtensions.Convert`
+- `AnimationClipConverter.Process -> ProcessInner`
+- `ProcessStreams / ProcessDenses / ProcessACLClip / ProcessConstant / CreateCurves`
+- `ConvertSerializedAnimationClip -> ExportYAMLDocument -> YAMLWriter.Write`
+- `File.WriteAllText(... .anim)`
 
-#### C) `ReadAssets` 直接起点（既読込みデータあり）
-`ReadAssets -> AnimationClip生成 -> Exporter.ExportAnimationClip -> Convert -> YAML化 -> File.WriteAllText(... .anim)`
+### 3-3 パス解決鎖
+- `FindTOS -> BuildTOS -> GetCurvePath -> AddCustomCurve -> CustomCurveResolver.ToAttributeName`
 
-### D-3. Exporter起点ごとの終点到達遷移
+## 4) 全コードファイルの始点→終点関連表（.cs 全件）
 
-#### A) `ExportAnimationClip` 起点（CLI/GUI共通）
-`ExportAnimationClip -> TryExportFile(.anim) -> m_AnimationClip.Convert() -> File.WriteAllText(exportFullPath, yaml)`
+凡例:
+- 役割=そのファイルの責務
+- 終点関連=`.anim`終点に対して直接/間接/非対象
+- チェーンID=該当する正規トレースID
 
-#### B) `ExportConvertFile` 起点
-`ExportConvertFile -> switch(item.TypeString) -> ClassIDType.AnimationClip -> ExportAnimationClip -> (上記A)`
+| ファイル | 役割 | 終点関連 | チェーンID |
+|---|---|---|---|
+| `AssetStudio.CLI/Components/AssetItem.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.CLI/Components/CommandLine.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.CLI/Exporter.cs` | 直接経路 | 到達(直接) | CHAIN-E1 |
+| `AssetStudio.CLI/Program.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.CLI/Settings.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.CLI/Studio.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.FBXWrapper/Fbx.PInvoke.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.FBXWrapper/Fbx.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.FBXWrapper/FbxDll.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.FBXWrapper/FbxExporter.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.FBXWrapper/FbxExporterContext.PInvoke.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.FBXWrapper/FbxExporterContext.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.GUI/AssetBrowser.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/AssetBrowser.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Components/AssetItem.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Components/GOHierarchy.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Components/GameObjectTreeNode.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Components/OpenFolderDialog.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Components/TypeTreeItem.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/DirectBitmap.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/ExportOptions.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/ExportOptions.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Exporter.cs` | 直接経路 | 到達(直接) | CHAIN-E1 |
+| `AssetStudio.GUI/GUILogger.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/MainForm.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/MainForm.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Program.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Properties/Resources.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Properties/Settings.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/Studio.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/UnityCNForm.Designer.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.GUI/UnityCNForm.cs` | UI/操作層 | 到達(間接) | - |
+| `AssetStudio.PInvoke/DllLoader.cs` | FBX/ネイティブ補助 | 非対象 | - |
+| `AssetStudio.Utility/ACL/ACL.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ACL/ACLExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/AssemblyLoader.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/AudioClipConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/Disassembler.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/EnumValuesExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/Instruction.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/Module.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/OperandType.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/ParsedInstruction.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/Reader.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/SpirV.Core.Grammar.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/SpirV.Meta.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/CSspv/Types.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ConsoleHelper.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/FMOD Studio API/fmod.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/FMOD Studio API/fmod_dsp.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/FMOD Studio API/fmod_errors.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/FontHelper.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ImageExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ImageFormat.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ModelConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ModelExporter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/MonoBehaviourConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/MyAssemblyResolver.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/SerializedTypeHelper.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/ShaderConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Smolv/OpData.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Smolv/SmolvDecoder.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Smolv/SpvOp.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/SpirVShaderConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/SpriteHelper.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Texture2DConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Texture2DExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/TypeDefinitionConverter.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/CecilUtils.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/ElementType.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/Extensions/MethodDefinitionExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/Extensions/ResolutionExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/Extensions/TypeDefinitionExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.CecilTools/Extensions/TypeReferenceExtensions.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.SerializationLogic/UnityEngineTypePredicates.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/Unity.SerializationLogic/UnitySerializationLogic.cs` | ユーティリティ補助 | 到達(間接) | - |
+| `AssetStudio.Utility/YAML/AnimationClipConverter.cs` | 直接経路 | 到達(直接) | CHAIN-C1 |
+| `AssetStudio.Utility/YAML/AnimationClipExtensions.cs` | 直接経路 | 到達(直接) | CHAIN-C1 |
+| `AssetStudio.Utility/YAML/CustomCurveResolver.cs` | 直接経路 | 到達(直接) | CHAIN-P1 |
+| `AssetStudio.Utility/YAML/MuscleHelper.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/7zip/Common/CRC.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Common/CommandLineParser.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Common/InBuffer.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Common/OutBuffer.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZ/IMatchFinder.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZ/LzBinTree.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZ/LzInWindow.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZ/LzOutWindow.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZMA/LzmaBase.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZMA/LzmaDecoder.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/LZMA/LzmaEncoder.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/RangeCoder/RangeCoder.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/RangeCoder/RangeCoderBit.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/Compress/RangeCoder/RangeCoderBitTree.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/7zip/ICoder.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/AIVersionManager.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/AssetGroupOption.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/AssetIndex.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/AssetMap.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/AssetsHelper.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/AssetsManager.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/BlbFile.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/Brotli/BitReader.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/BrotliInputStream.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/BrotliRuntimeException.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Context.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Decode.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Dictionary.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Huffman.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/HuffmanTreeGroup.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/IntReader.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Prefix.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/RunningState.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/State.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Transform.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/Utils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Brotli/WordTransformType.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/BuildTarget.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/BuildType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/BundleFile.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/ClassIDType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Classes/Animation.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/AnimationClip.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/Classes/Animator.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/AnimatorController.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/AnimatorOverrideController.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/AssetBundle.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/AudioClip.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Avatar.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Behaviour.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/BuildSettings.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Component.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/EditorExtension.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Font.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/GameObject.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/IndexObject.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Material.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Mesh.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MeshFilter.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MeshRenderer.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MiHoYoBinData.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MonoBehaviour.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MonoScript.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/MovieTexture.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/NamedObject.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Object.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/PPtr.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/PlayerSettings.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/RectTransform.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Renderer.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/ResourceManager.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/RuntimeAnimatorController.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Shader.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/SkinnedMeshRenderer.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Sprite.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/SpriteAtlas.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/TextAsset.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Texture.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Texture2D.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/Transform.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/Classes/VideoClip.cs` | データ型/参照解決 | 到達(間接) | - |
+| `AssetStudio/CommonString.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Crypto/AES.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/BlkUtils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/CryptoHelper.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/FairGuardUtils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/MT19937_64.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/Mr0kUtils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/NetEaseUtils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/OPFPUtils.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/UnityCN.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/Crypto/XORShift128.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/EndianBinaryReader.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/EndianType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ExportType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ExportTypeList.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Extensions/ByteArrayExtensions.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Extensions/StreamExtensions.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/FileIdentifier.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/FileReader.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/FileType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/GameManager.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Helpers/KVPConverter.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/IImported.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ILogger.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ImportHelper.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/LZ4/LZ4.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/LZ4/LZ4Inv.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/LZ4/LZ4Lit.cs` | 読込補助(復号/展開) | 到達(間接) | - |
+| `AssetStudio/LocalSerializedObjectIdentifier.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Logger.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Color.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Float.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Half.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/HalfHelper.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Matrix4x4.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Quaternion.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Vector2.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Vector3.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/Vector4.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Math/XForm.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/MhyFile.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/ObjectInfo.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ObjectReader.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/OffsetStream.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/Progress.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ResourceIndex.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ResourceMap.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/ResourceReader.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/SerializedFile.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/SerializedFileFormatVersion.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/SerializedFileHeader.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/SerializedType.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/SevenZipHelper.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/StreamFile.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/TypeFlags.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/TypeTree.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/TypeTreeHelper.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/TypeTreeNode.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/UnityCNManager.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/WebFile.cs` | 直接経路 | 到達(直接) | CHAIN-L1 |
+| `AssetStudio/XORStream.cs` | コア補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/Emitter.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/IYAMLExportable.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/MappingStyle.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/MetaType.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/ScalarStyle.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/ScalarType.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/SequenceStyle.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLDocument.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLMappingNode.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLNode.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLNodeType.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLScalarNode.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLSequenceNode.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLTag.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Base/YAMLWriter.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/ArrayYAMLExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/BitConverterExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/EmitterExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/IDictionaryExportYAMLExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/IDictionaryYAMLExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/IEnumerableYAMLExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/IListYAMLExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/PrimitiveExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/StringBuilderExtensions.cs` | 変換補助 | 到達(間接) | - |
+| `AssetStudio/YAML/Utils/Extensions/YAMLMappingNodeExtensions.cs` | 変換補助 | 到達(間接) | - |
 
-### D-4. Convert起点ごとの終点到達遷移
-
-#### A) `AnimationClipExtensions.Convert` 起点
-1. 条件分岐 `!m_Legacy || m_MuscleClip != null`
-2. 真なら `AnimationClipConverter.Process`
-3. 返却カーブを `Union` で既存カーブへ統合
-4. `ConvertSerializedAnimationClip` へ
-5. YAML文字列返却
-6. 呼び出し元Exporterが `File.WriteAllText(... .anim)`
-
-#### B) `AnimationClipConverter.Process` 起点
-`Process -> ProcessInner -> (ProcessACLClip?) -> ProcessStreams -> ProcessDenses -> (ProcessACLClip?) -> ProcessConstant? -> CreateCurves -> return converter`
-
-### D-5. 変換内の全主要関数と役割
-- `ProcessInner`: 実行順序制御・最終フレーム管理
-- `ProcessStreams`: streamedキー処理（傾き計算含む）
-- `ProcessDenses`: denseサンプル展開
-- `ProcessACLClip`: ACL圧縮展開
-- `ProcessConstant`: constant終端補完
-- `AddTransformCurve`: Transform系キー追加
-- `AddDefaultCurve`: 標準Float系キー追加
-- `AddCustomCurve`: customType系キー追加（属性名解決あり）
-- `AddFloatKeyframe`: FloatCurveへキー追加
-- `AddPPtrKeyframe`: PPtrCurveへキー追加
-- `GetCurvePath`: pathハッシュ->文字列path（未知は`path_<hash>`）
-- `CreateCurves`: 内部辞書を最終カーブへコミット
-
-### D-6. パス処理の全遷移
-`FindTOS -> (AddAvatarTOS | AddAnimatorTOS | AddAnimationTOS) -> BuildTOS -> GetCurvePath -> AddCustomCurve -> CustomCurveResolver.ToAttributeName`
-
-### D-7. YAML終点の全遷移
-`ConvertSerializedAnimationClip -> ExportYAMLDocument -> YAMLWriter.AddDocument -> YAMLWriter.Write -> ExportAnimationClip -> File.WriteAllText(.anim)`
+## 5) 抜け確認
+- [x] 全 `.cs` ファイルを一覧化
+- [x] 直接経路の関数名を明示
+- [x] パス解決関数鎖を明示
+- [x] 終点を `File.WriteAllText(.anim)` に固定
