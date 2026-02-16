@@ -170,6 +170,31 @@ Bundle読込とAnimation変換を最初から整理（完全版）
 ### B-7. Bの成果物
 - `.anim`（Unity YAML形式）
 
+
+### B-8. 抜けゼロ検証表（コード照合）
+
+| フェーズ | 入力 | 主要分岐 | パス利用 | 出力 |
+|---|---|---|---|---|
+| `ProcessStreams` | `streamFrames`, `bindings`, `tos`, `sampleRate` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | Transform/Default/Customキー追加 |
+| `ProcessDenses` | `dense.m_SampleArray`, `bindings`, `tos` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | 時系列キー追加 |
+| `ProcessACLClip` | `acl.Process(...)` 展開値, `bindings`, `tos` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | ACL由来キー追加 |
+| `ProcessConstant` | `constant.data`, `bindings`, `tos`, `lastFrame` | `Transform` / `customType==None` / `Custom` | `GetCurvePath(tos, binding.path)` | 終端補完キー追加 |
+| `CreateCurves` | 内部辞書 (`m_translations` など) | なし | なし | `Translations/Rotations/...` へ確定 |
+| `ConvertSerializedAnimationClip` | `AnimationClip` | なし | なし | YAML文字列 |
+
+### B-9. 未記載項目なしチェックリスト
+
+- [x] 入口 (`ExportAnimationClip`)
+- [x] `AnimationClipExtensions.Convert` の条件分岐
+- [x] `ProcessInner` の実行順序
+- [x] `ProcessStreams` / `ProcessDenses` / `ProcessACLClip` / `ProcessConstant`
+- [x] `FindTOS` と `GetCurvePath`
+- [x] UnknownPath (`path_<hash>`) フォールバック
+- [x] `CustomCurveResolver.ToAttributeName`
+- [x] `CreateCurves` での最終反映
+- [x] `ConvertSerializedAnimationClip` -> `ExportYAMLDocument` -> `YAMLWriter.Write`
+- [x] `.anim` ファイル書き込み (`File.WriteAllText`)
+
 ---
 
 ## A/B 接続点（実装境界）
