@@ -105,43 +105,70 @@ Bundle読込とAnimation変換を最初から整理（完全版）
 
 ## B. Animation変換処理（Convert / Serialize / Write）
 
-### B-1. エントリ
-- `Exporter.ExportAnimationClip`（CLI/GUI）
-- `m_AnimationClip.Convert()` を呼ぶ
+### B-1. 入口（Exporter）
+- `AssetStudio.CLI/Exporter.cs` と `AssetStudio.GUI/Exporter.cs` の `ExportAnimationClip` が入口。
+- `m_AnimationClip.Convert()` を呼び、戻り値文字列を `File.WriteAllText(... .anim)` で保存。
 
-### B-2. `AnimationClipExtensions.Convert`
-- 条件 `!clip.m_Legacy || clip.m_MuscleClip != null` で `AnimationClipConverter.Process(clip)`
-- 返ってきた曲線群を既存カーブへ `Union`
-- `ConvertSerializedAnimationClip` でYAML化
+### B-2. Convertの外枠（`AnimationClipExtensions.Convert`）
+1. 対象が `!m_Legacy || m_MuscleClip != null` の場合、`AnimationClipConverter.Process(clip)` を実行。
+2. `Process` が生成したカーブ群を既存カーブへ `Union`:
+   - `m_RotationCurves`
+   - `m_EulerCurves`
+   - `m_PositionCurves`
+   - `m_ScaleCurves`
+   - `m_FloatCurves`
+   - `m_PPtrCurves`
+3. `ConvertSerializedAnimationClip` で YAML 文字列へ変換。
 
-### B-3. SAM原文（生データ）
-ここでいうSAM原文は `AnimationClip` 内の次の生データ群:
-- `m_StreamedClip`
-- `m_DenseClip`
-- `m_ACLClip`
-- `m_ConstantClip`
+### B-3. 変換の中心（`AnimationClipConverter.ProcessInner`）
+`AnimationClipConverter.Process` は内部で `ProcessInner` を実行し、以下の順で処理する。
 
-### B-4. 生データ -> カーブの変換順（実コード順）
-1. `ProcessInner` で `m_MuscleClip.m_Clip`, `m_ClipBindingConstant`, `FindTOS()` を取得
-2. `m_StreamedClip.ReadData()` でstreamフレームを復元
-3. `ProcessACLClip`（条件付き）でACLデータを通常値列へ復元
-4. `ProcessStreams` でstreamキーをbindingへ割当
-5. `ProcessDenses` でdense配列を時系列キーへ展開
-6. `ProcessConstant` でconstant値を終端へ補完
-7. `CreateCurves` で Transform/Float/PPtr カーブへ集約
-8. `ConvertSerializedAnimationClip` -> `ExportYAMLDocument` -> `YAMLWriter.Write`
+1. **前処理**
+   - `m_Clip = animationClip.m_MuscleClip.m_Clip`
+   - `bindings = animationClip.m_ClipBindingConstant`
+   - `tos = animationClip.FindTOS()`
+2. **生データ展開**
+   - `streamedFrames = m_Clip.m_StreamedClip.ReadData()`
+   - `lastFrame`（dense/stream 由来）を計算
+3. **ACL先行処理（条件付き）**
+   - `m_ACLClip.IsSet && !SR` の場合、先に `ProcessACLClip` を実行
+4. **stream処理**
+   - `ProcessStreams(streamedFrames, bindings, tos, sampleRate)`
+5. **dense処理**
+   - `ProcessDenses(m_Clip, bindings, tos)`
+6. **ACL後行処理（SR条件）**
+   - `m_ACLClip.IsSet && SR` の場合、ここで `ProcessACLClip`
+7. **constant処理**
+   - `m_ConstantClip != null` の場合、`ProcessConstant`
+8. **カーブ確定**
+   - `CreateCurves()` で内部辞書から最終カーブ配列へ反映
 
-### B-5. パス処理（重要）
-1. `FindTOS()` が `Dictionary<uint,string>` を作る
-   - ルートは `0 -> ""`
-   - 子ノードを `parent/child` で連結し、`CRC.CalculateDigestUTF8(path)` をキー化
-2. 各処理で `binding.path` を `GetCurvePath(tos, binding.path)` に通す
-3. 見つからないハッシュは `path_<hash>`（UnknownPath）
-4. `AddCustomCurve` が `CustomCurveResolver.ToAttributeName(type, attribute, path)` で最終プロパティ名へ変換
-5. UnknownPathはフォールバック名で出力継続（変換は止めない）
+### B-4. 各フェーズで何を変換しているか
+- `ProcessStreams`
+  - streamフレームのキー列を走査し、`bindings.FindBinding(index)` でバインディング特定。
+  - Transform系は `AddTransformCurve`、それ以外は `AddDefaultCurve`/`AddCustomCurve`。
+- `ProcessDenses`
+  - dense配列を `frameIndex / sampleRate` の時間軸で展開。
+  - binding種別ごとに Transform/Default/Custom へ分配。
+- `ProcessACLClip`
+  - `acl.Process(...)` でACL圧縮値を展開し、時間付きキー列へ変換。
+- `ProcessConstant`
+  - constant値を `lastFrame` に配置し、不足終端を補完。
 
-### B-6. Bの成果物
-- `.anim`（YAMLテキスト）
+### B-5. パス解決（変換で必須）
+1. `FindTOS()` が `Dictionary<uint, string>` を構築（`CRC.CalculateDigestUTF8(path)` -> `path`）。
+2. 各フェーズで `binding.path` を `GetCurvePath(tos, binding.path)` で文字列パスへ変換。
+3. 見つからないハッシュは `path_<hash>` を返して継続。
+4. `AddCustomCurve` は `CustomCurveResolver.ToAttributeName(customType, attribute, path)` で最終プロパティ名へ解決。
+
+### B-6. YAML化（`ConvertSerializedAnimationClip`）
+1. `ExportYAMLDocument(animationClip)` でYAMLドキュメント作成
+2. `YAMLWriter.AddDocument(doc)`
+3. `YAMLWriter.Write(StringWriter)`
+4. 生成文字列をExporterが `.anim` として保存
+
+### B-7. Bの成果物
+- `.anim`（Unity YAML形式）
 
 ---
 
