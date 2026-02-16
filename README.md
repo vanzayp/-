@@ -309,3 +309,104 @@ Bundle読込とAnimation変換を最初から整理（完全版）
 - [x] Block/Blk/Mhy始点
 - [x] Path解決始点
 - [x] YAML出力終端
+
+
+## D. 「全始点→終点」関数遷移表（曖昧語なし）
+
+> ここでの「始点」は、AnimationClipが`.anim`へ到達し得る**実際の関数入口**を指す。
+> それぞれに対し、終点 `File.WriteAllText(... .anim)` までの遷移を列挙する。
+
+### D-1. 始点群（入口関数を全列挙）
+
+#### 1) 読み込み入口（AssetsManager）
+- `LoadFiles`
+- `LoadFolder`
+- `Load`（内部キュー処理）
+- `LoadFile(string)`
+- `LoadFile(FileReader)`
+- `LoadAssetsFile`
+- `LoadBundleFile`
+- `LoadWebFile`
+- `LoadZipFile`
+- `LoadBlockFile`
+- `LoadBlkFile`
+- `LoadMhyFile`
+- `LoadAssetsFromMemory`
+- `ReadAssets`
+- `ProcessAssets`
+
+#### 2) 変換入口（Exporter）
+- `AssetStudio.CLI.Exporter.ExportAnimationClip`
+- `AssetStudio.GUI.Exporter.ExportAnimationClip`
+- `AssetStudio.CLI.Exporter.ExportConvertFile`（内部で `ClassIDType.AnimationClip` なら `ExportAnimationClip`）
+- `AssetStudio.GUI.Exporter.ExportConvertFile`（同上）
+
+#### 3) 変換コア入口
+- `AnimationClipExtensions.Convert`
+- `AnimationClipConverter.Process`
+
+### D-2. 読み込み入口ごとの終点到達遷移
+
+#### A) `LoadFiles` / `LoadFolder` 起点
+`LoadFiles|LoadFolder -> Load -> LoadFile(string) -> LoadFile(FileReader)`
+
+`LoadFile(FileReader)` の分岐:
+- `AssetsFile -> LoadAssetsFile -> (必要なら外部参照追加) -> ReadAssets`
+- `BundleFile -> LoadBundleFile -> LoadAssetsFromMemory -> ReadAssets`
+- `WebFile -> LoadWebFile -> (Assets/Bundle/Web/Resource 再帰) -> ReadAssets`
+- `ZipFile -> LoadZipFile -> (entryごとにLoadFile再投入) -> ReadAssets`
+- `BlockFile -> LoadBlockFile -> (Bundle/Blb/Mhyへ再分岐) -> ReadAssets`
+- `BlkFile -> LoadBlkFile -> (Bundle/Mhyへ再分岐) -> ReadAssets`
+- `MhyFile -> LoadMhyFile -> LoadAssetsFromMemory -> ReadAssets`
+
+`ReadAssets` 到達後:
+- `ClassIDType.AnimationClip => new AnimationClip(objectReader)`
+- GUI/CLIで対象が選択されると `Exporter.ExportAnimationClip` へ
+- 終点: `File.WriteAllText(... .anim)`
+
+#### B) `LoadAssetsFromMemory` 直接起点
+`LoadAssetsFromMemory -> assetsFileList登録 -> ReadAssets -> AnimationClip生成 -> Exporter.ExportAnimationClip -> File.WriteAllText(... .anim)`
+
+#### C) `ReadAssets` 直接起点（既読込みデータあり）
+`ReadAssets -> AnimationClip生成 -> Exporter.ExportAnimationClip -> Convert -> YAML化 -> File.WriteAllText(... .anim)`
+
+### D-3. Exporter起点ごとの終点到達遷移
+
+#### A) `ExportAnimationClip` 起点（CLI/GUI共通）
+`ExportAnimationClip -> TryExportFile(.anim) -> m_AnimationClip.Convert() -> File.WriteAllText(exportFullPath, yaml)`
+
+#### B) `ExportConvertFile` 起点
+`ExportConvertFile -> switch(item.TypeString) -> ClassIDType.AnimationClip -> ExportAnimationClip -> (上記A)`
+
+### D-4. Convert起点ごとの終点到達遷移
+
+#### A) `AnimationClipExtensions.Convert` 起点
+1. 条件分岐 `!m_Legacy || m_MuscleClip != null`
+2. 真なら `AnimationClipConverter.Process`
+3. 返却カーブを `Union` で既存カーブへ統合
+4. `ConvertSerializedAnimationClip` へ
+5. YAML文字列返却
+6. 呼び出し元Exporterが `File.WriteAllText(... .anim)`
+
+#### B) `AnimationClipConverter.Process` 起点
+`Process -> ProcessInner -> (ProcessACLClip?) -> ProcessStreams -> ProcessDenses -> (ProcessACLClip?) -> ProcessConstant? -> CreateCurves -> return converter`
+
+### D-5. 変換内の全主要関数と役割
+- `ProcessInner`: 実行順序制御・最終フレーム管理
+- `ProcessStreams`: streamedキー処理（傾き計算含む）
+- `ProcessDenses`: denseサンプル展開
+- `ProcessACLClip`: ACL圧縮展開
+- `ProcessConstant`: constant終端補完
+- `AddTransformCurve`: Transform系キー追加
+- `AddDefaultCurve`: 標準Float系キー追加
+- `AddCustomCurve`: customType系キー追加（属性名解決あり）
+- `AddFloatKeyframe`: FloatCurveへキー追加
+- `AddPPtrKeyframe`: PPtrCurveへキー追加
+- `GetCurvePath`: pathハッシュ->文字列path（未知は`path_<hash>`）
+- `CreateCurves`: 内部辞書を最終カーブへコミット
+
+### D-6. パス処理の全遷移
+`FindTOS -> (AddAvatarTOS | AddAnimatorTOS | AddAnimationTOS) -> BuildTOS -> GetCurvePath -> AddCustomCurve -> CustomCurveResolver.ToAttributeName`
+
+### D-7. YAML終点の全遷移
+`ConvertSerializedAnimationClip -> ExportYAMLDocument -> YAMLWriter.AddDocument -> YAMLWriter.Write -> ExportAnimationClip -> File.WriteAllText(.anim)`
